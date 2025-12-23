@@ -1,0 +1,14 @@
+{
+  "header": {
+    "company_id":"01","branch_code":"01","customer_id":null,
+    "invoice_date":"2025-09-22T11:05:00+08:00",
+    "round_off":0,"created_by":"01"
+  },
+  "lines": [
+    { "product_code":"AABBCC","qty":2,"price":12.50,"discount":0,"tax_rate":18.0 }
+  ],
+  "payments": [
+    { "mode":"UPI","amount":25.00,"ref_no":"UPI-123" }
+  ]
+}
+

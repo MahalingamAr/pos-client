@@ -1,0 +1,54 @@
+CREATE OR REPLACE FUNCTION pos.pos_delete_sales_invoice_by_no(
+  p_company_id   char(2),
+  p_state_id     char(2),
+  p_branch_id    char(2),
+  p_invoice_date date,
+  p_invoice_no   text
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO pos, public
+AS $$
+DECLARE
+  v_sales_id uuid;
+BEGIN
+  -- ✅ Lock header row to avoid concurrent delete/update
+  SELECT s.sales_id
+    INTO v_sales_id
+  FROM pos.sales_invoice s
+  WHERE s.company_id   = p_company_id
+    AND s.state_id     = p_state_id
+    AND s.branch_id    = p_branch_id
+    AND s.invoice_date = p_invoice_date
+    AND s.invoice_no   = p_invoice_no
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN 'NOT_FOUND';
+  END IF;
+
+  -- ✅ Add back stock for items being deleted
+  UPDATE pos.branch_products bp
+  SET on_hand_qty = COALESCE(bp.on_hand_qty, 0) + x.qty
+  FROM (
+    SELECT
+      product_id,
+      SUM(COALESCE(quantity, 0))::numeric AS qty
+    FROM pos.sales_invoice_item
+    WHERE sales_id = v_sales_id
+    GROUP BY product_id
+  ) x
+  WHERE bp.company_id = p_company_id
+    AND bp.state_id   = p_state_id
+    AND bp.branch_id  = p_branch_id
+    AND bp.product_id = x.product_id;
+
+  -- ✅ Then delete children -> header
+  DELETE FROM pos.sales_invoice_item WHERE sales_id = v_sales_id;
+  DELETE FROM pos.sales_invoice      WHERE sales_id = v_sales_id;
+
+  RETURN 'OK';
+END;
+$$;
+

@@ -1,0 +1,39 @@
+import { createClient } from '@supabase/supabase-js'
+
+create or replace function pos.get_sales_summary(start_date date, end_date date)
+returns table(branch_id text, total_sales numeric)
+language sql
+security definer
+as $$
+  select branch_id, sum(net_amount) as total_sales
+  from pos.sales_invoice
+  where invoice_date between start_date and end_date
+  group by branch_id;
+$$;
+
+
+
+
+// Initialize client
+const supabase = createClient(
+  'https://localhost:54321',
+  'YOUR_ANON_OR_SERVICE_KEY'
+)
+
+// Call the function
+async function getSalesSummary(startDate, endDate) {
+  const { data, error } = await supabase.rpc('pos.get_sales_summary', {
+    start_date: startDate,
+    end_date: endDate,
+  })
+
+  if (error) {
+    console.error('Error executing function:', error)
+    return null
+  }
+  return data
+}
+grant usage on schema pos to anon;
+grant execute on function pos.get_sales_summary(date, date) to anon;
+grant select on table pos.sales_invoice to anon;
+

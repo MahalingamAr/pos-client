@@ -1,0 +1,12 @@
+CREATE OR REPLACE FUNCTION pos.pos_get_company_by_id(p_company_id char(2))
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path TO pos, public
+AS $$
+  SELECT to_jsonb(c)
+  FROM pos.companies c
+  WHERE c.company_id = p_company_id;
+$$;
+

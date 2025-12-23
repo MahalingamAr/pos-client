@@ -1,0 +1,249 @@
+DROP FUNCTION IF EXISTS pos.pos_create_sales_invoice(jsonb) CASCADE;
+
+CREATE OR REPLACE FUNCTION pos.pos_create_sales_invoice(p_data jsonb)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO pos, public
+AS $$
+DECLARE
+  v_sales_id      uuid;
+
+  v_company_id    char(2);
+  v_state_id      char(2);
+  v_branch_id     char(2);
+
+  -- supports walk-in phone/id
+  v_client_id     varchar(10);
+
+  v_customer_name  text;
+  v_customer_phone varchar(20);
+
+  v_payment_mode  text;
+  v_invoice_date  date;
+  v_invoice_no    text;
+
+  v_created_by    varchar(15);
+  v_remarks       text;
+
+  v_is_igst       boolean := false;
+
+  -- Header totals (stored as-is from UI)
+  v_gross_amount     numeric(12,2);
+  v_discount_amount  numeric(12,2);
+  v_taxable_amount   numeric(12,2);
+  v_cgst_amount      numeric(12,2);
+  v_sgst_amount      numeric(12,2);
+  v_igst_amount      numeric(12,2);
+  v_tax_amount       numeric(12,2);
+  v_net_amount       numeric(12,2);
+  v_paid_amount      numeric(12,2);
+  v_balance_amount   numeric(12,2);
+
+  -- Loop vars
+  v_item          jsonb;
+  v_line_no       smallint := 0;
+
+  v_product_id    char(6);
+  v_qty           numeric(12,3);
+  v_uom           text;
+  v_unit_price    numeric(12,2);
+  v_mrp           numeric(12,2);
+  v_discount_pct  numeric(5,2);
+
+  v_line_gross    numeric(12,2);
+  v_line_disc_amt numeric(12,2);
+  v_line_taxable  numeric(12,2);
+
+  v_cgst_amt      numeric(12,2);
+  v_sgst_amt      numeric(12,2);
+  v_igst_amt      numeric(12,2);
+
+  v_line_tax      numeric(12,2);
+  v_line_total    numeric(12,2);
+
+  v_onhand        numeric(12,3);
+BEGIN
+  /* ---------- HEADER EXTRACTION ---------- */
+  v_company_id := NULLIF(p_data->>'company_id','')::char(2);
+  v_state_id   := NULLIF(p_data->>'state_id','')::char(2);
+  v_branch_id  := NULLIF(p_data->>'branch_id','')::char(2);
+
+  IF v_company_id IS NULL OR v_state_id IS NULL OR v_branch_id IS NULL THEN
+    RAISE EXCEPTION 'Missing company_id/state_id/branch_id in pos_create_sales_invoice()';
+  END IF;
+
+  v_client_id      := NULLIF(p_data->>'client_id','')::varchar(10);
+  v_customer_name  := NULLIF(p_data->>'customer_name','');
+  v_customer_phone := NULLIF(p_data->>'customer_phone','');
+
+  v_payment_mode := COALESCE(NULLIF(p_data->>'payment_mode',''),'CASH');
+  v_created_by   := COALESCE(NULLIF(p_data->>'created_by',''),'system');
+  v_remarks      := NULLIF(p_data->>'remarks','');
+  v_invoice_date := COALESCE(NULLIF(p_data->>'invoice_date','')::date, CURRENT_DATE);
+
+  v_is_igst := COALESCE(NULLIF(p_data->>'is_igst','')::boolean, false);
+
+  v_gross_amount    := COALESCE(NULLIF(p_data->>'gross_amount','')::numeric, 0);
+  v_discount_amount := COALESCE(NULLIF(p_data->>'discount_amount','')::numeric, 0);
+  v_taxable_amount  := COALESCE(NULLIF(p_data->>'taxable_amount','')::numeric, 0);
+
+  v_cgst_amount     := COALESCE(NULLIF(p_data->>'cgst_amount','')::numeric, 0);
+  v_sgst_amount     := COALESCE(NULLIF(p_data->>'sgst_amount','')::numeric, 0);
+  v_igst_amount     := COALESCE(NULLIF(p_data->>'igst_amount','')::numeric, 0);
+
+  v_tax_amount      := COALESCE(NULLIF(p_data->>'tax_amount','')::numeric, 0);
+  v_net_amount      := COALESCE(NULLIF(p_data->>'net_amount','')::numeric, 0);
+  v_paid_amount     := COALESCE(NULLIF(p_data->>'paid_amount','')::numeric, 0);
+  v_balance_amount  := COALESCE(NULLIF(p_data->>'balance_amount','')::numeric, 0);
+
+  /* ---------- Invoice no: from JSON or generate ---------- */
+  v_invoice_no := NULLIF(p_data->>'invoice_no','');
+  IF v_invoice_no IS NULL THEN
+    v_invoice_no := pos.pos_get_next_invoice_no(v_company_id, v_state_id, v_branch_id, v_invoice_date);
+  END IF;
+
+  IF v_invoice_no IS NULL THEN
+    RAISE EXCEPTION 'Could not determine invoice_no in pos_create_sales_invoice()';
+  END IF;
+
+  IF jsonb_array_length(COALESCE(p_data->'items','[]'::jsonb)) = 0 THEN
+    RAISE EXCEPTION 'No items supplied to pos_create_sales_invoice()';
+  END IF;
+
+  /* ---------- INSERT HEADER ---------- */
+  BEGIN
+    INSERT INTO pos.sales_invoice (
+      company_id, state_id, branch_id,
+      invoice_no, invoice_date,
+      client_id, customer_name, customer_phone,
+      payment_mode,
+      is_igst,
+      gross_amount, discount_amount, taxable_amount,
+      cgst_amount, sgst_amount, igst_amount,
+      tax_amount, net_amount,
+      paid_amount, balance_amount,
+      remarks,
+      created_by,
+      status
+    )
+    VALUES (
+      v_company_id, v_state_id, v_branch_id,
+      v_invoice_no, v_invoice_date,
+      v_client_id, v_customer_name, v_customer_phone,
+      v_payment_mode,
+      v_is_igst,
+      v_gross_amount, v_discount_amount, v_taxable_amount,
+      v_cgst_amount, v_sgst_amount, v_igst_amount,
+      v_tax_amount, v_net_amount,
+      v_paid_amount, v_balance_amount,
+      v_remarks,
+      v_created_by,
+      'ACTIVE'
+    )
+    RETURNING sales_id INTO v_sales_id;
+
+  EXCEPTION WHEN unique_violation THEN
+    RAISE EXCEPTION 'Invoice already exists: % / % / % / % / %',
+      v_company_id, v_state_id, v_branch_id, v_invoice_date, v_invoice_no
+      USING ERRCODE = '23505';
+  END;
+
+  /* ---------- INSERT ITEMS & STOCK ---------- */
+  FOR v_item IN SELECT * FROM jsonb_array_elements(p_data->'items')
+  LOOP
+    v_line_no := v_line_no + 1;
+
+    v_product_id := NULLIF(v_item->>'product_id','')::char(6);
+    v_qty        := COALESCE(NULLIF(v_item->>'quantity','')::numeric, 0);
+    v_uom        := COALESCE(NULLIF(v_item->>'uom',''), 'PCS');
+
+    v_unit_price := COALESCE(NULLIF(v_item->>'unit_price','')::numeric, 0);
+    v_mrp        := NULLIF(v_item->>'mrp','')::numeric;
+
+    v_discount_pct := COALESCE(NULLIF(v_item->>'discount_pct','')::numeric, 0);
+
+    v_line_gross    := COALESCE(NULLIF(v_item->>'gross_amount','')::numeric, 0);
+    v_line_disc_amt := COALESCE(NULLIF(v_item->>'discount_amount','')::numeric, 0);
+    v_line_taxable  := COALESCE(NULLIF(v_item->>'taxable_amount','')::numeric, 0);
+
+    v_cgst_amt := COALESCE(NULLIF(v_item->>'cgst_amount','')::numeric, 0);
+    v_sgst_amt := COALESCE(NULLIF(v_item->>'sgst_amount','')::numeric, 0);
+    v_igst_amt := COALESCE(NULLIF(v_item->>'igst_amount','')::numeric, 0);
+
+    v_line_tax   := COALESCE(NULLIF(v_item->>'tax_amount','')::numeric, 0);
+    v_line_total := COALESCE(NULLIF(v_item->>'line_total','')::numeric, 0);
+
+    IF v_product_id IS NULL THEN
+      RAISE EXCEPTION 'Item missing product_id at line %', v_line_no;
+    END IF;
+    IF v_qty <= 0 THEN
+      RAISE EXCEPTION 'Invalid quantity (<=0) for product % at line %', v_product_id, v_line_no;
+    END IF;
+
+    -- Lock branch_products row & validate stock row exists
+    SELECT COALESCE(bp.on_hand_qty, 0)
+      INTO v_onhand
+    FROM pos.branch_products bp
+    WHERE bp.company_id = v_company_id
+      AND bp.state_id   = v_state_id
+      AND bp.branch_id  = v_branch_id
+      AND bp.product_id = v_product_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'No branch_products row for product % at this branch', v_product_id;
+    END IF;
+
+    -- block negative stock (optional)
+    IF v_onhand < v_qty THEN
+      RAISE EXCEPTION 'Insufficient stock for product % (onhand %, needed %)', v_product_id, v_onhand, v_qty;
+    END IF;
+
+    INSERT INTO pos.sales_invoice_item (
+      sales_id, line_no, product_id,
+      quantity, uom,
+      unit_price, mrp,
+      discount_pct, discount_amount,
+      taxable_amount,
+      cgst_amount, sgst_amount, igst_amount,
+      tax_amount,
+      line_total,
+      status
+    )
+    VALUES (
+      v_sales_id, v_line_no, v_product_id,
+      v_qty, v_uom,
+      v_unit_price, v_mrp,
+      v_discount_pct, v_line_disc_amt,
+      v_line_taxable,
+      v_cgst_amt, v_sgst_amt, v_igst_amt,
+      v_line_tax,
+      v_line_total,
+      'ACTIVE'
+    );
+
+    INSERT INTO pos.stock_ledger (
+      company_id, state_id, branch_id, product_id,
+      movement_time, movement_type, qty_in, qty_out,
+      ref_table, ref_id
+    )
+    VALUES (
+      v_company_id, v_state_id, v_branch_id, v_product_id,
+      now(), 'SALE', 0, v_qty,
+      'sales_invoice', v_sales_id
+    );
+
+    UPDATE pos.branch_products
+    SET on_hand_qty = COALESCE(on_hand_qty, 0) - v_qty,
+        updated_at  = now()
+    WHERE company_id = v_company_id
+      AND state_id   = v_state_id
+      AND branch_id  = v_branch_id
+      AND product_id = v_product_id;
+  END LOOP;
+
+  RETURN v_sales_id;
+END;
+$$;
+

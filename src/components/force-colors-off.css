@@ -1,0 +1,3 @@
+/* Stops Windows/Browser from overriding your colors */
+.fc-off { forced-color-adjust: none; }
+

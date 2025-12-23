@@ -1,0 +1,198 @@
+CREATE OR REPLACE FUNCTION pos.pos_update_sales_invoice(
+  p_sales_id uuid,
+  p_data     jsonb
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO pos, public
+AS $$
+DECLARE
+  v_items      jsonb;
+
+  v_company_id char(2);
+  v_state_id   char(2);
+  v_branch_id  char(2);
+BEGIN
+  IF p_sales_id IS NULL THEN
+    RAISE EXCEPTION 'p_sales_id is required';
+  END IF;
+
+  v_items := COALESCE(p_data->'items', '[]'::jsonb);
+
+  -- ✅ Lock + get branch context from existing invoice
+  SELECT s.company_id, s.state_id, s.branch_id
+    INTO v_company_id, v_state_id, v_branch_id
+  FROM pos.sales_invoice s
+  WHERE s.sales_id = p_sales_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Invoice not found for sales_id %', p_sales_id;
+  END IF;
+
+  /* ✅ NEW: do not allow changing invoice_no / invoice_date */
+  IF p_data ? 'invoice_no' AND NULLIF(TRIM(p_data->>'invoice_no'), '') IS NOT NULL THEN
+    RAISE EXCEPTION 'invoice_no cannot be changed for sales_id %', p_sales_id;
+  END IF;
+
+  IF p_data ? 'invoice_date' AND NULLIF(TRIM(p_data->>'invoice_date'), '') IS NOT NULL THEN
+    RAISE EXCEPTION 'invoice_date cannot be changed for sales_id %', p_sales_id;
+  END IF;
+
+  /* ✅ NEW: lock existing items rows too (prevents concurrent update issues) */
+  PERFORM 1
+  FROM pos.sales_invoice_item i
+  WHERE i.sales_id = p_sales_id
+  FOR UPDATE;
+
+  /* =========================================================
+     1) LEDGER: reverse OLD (ACTIVE only) => qty_in
+     ========================================================= */
+  INSERT INTO pos.stock_ledger(
+    company_id, state_id, branch_id, product_id,
+    movement_time, movement_type,
+    qty_in, qty_out,
+    ref_table, ref_id
+  )
+  SELECT
+    v_company_id, v_state_id, v_branch_id,
+    i.product_id,
+    now(),
+    'SALE'::text,
+    SUM(i.quantity)::numeric(12,3) AS qty_in,
+    0::numeric(12,3)               AS qty_out,
+    'sales_invoice',
+    p_sales_id
+  FROM pos.sales_invoice_item i
+  WHERE i.sales_id = p_sales_id
+    AND i.status = 'ACTIVE'
+  GROUP BY i.product_id;
+
+  /* =========================================================
+     2) Revert OLD stock (ACTIVE only): add back
+     ========================================================= */
+  UPDATE pos.branch_products bp
+  SET on_hand_qty = COALESCE(bp.on_hand_qty, 0) + x.qty
+  FROM (
+    SELECT product_id, SUM(quantity)::numeric(12,3) AS qty
+    FROM pos.sales_invoice_item
+    WHERE sales_id = p_sales_id
+      AND status = 'ACTIVE'
+    GROUP BY product_id
+  ) x
+  WHERE bp.company_id = v_company_id
+    AND bp.state_id   = v_state_id
+    AND bp.branch_id  = v_branch_id
+    AND bp.product_id = x.product_id;
+
+  /* =========================================================
+     3) Update header
+     ========================================================= */
+  UPDATE pos.sales_invoice s
+  SET
+    client_id        = NULLIF(p_data->>'client_id','')::varchar(10),
+    customer_name    = NULLIF(p_data->>'customer_name',''),
+    payment_mode     = COALESCE(p_data->>'payment_mode', s.payment_mode),
+
+    gross_amount     = COALESCE((p_data->>'gross_amount')::numeric, s.gross_amount),
+    discount_amount  = COALESCE((p_data->>'discount_amount')::numeric, s.discount_amount),
+    taxable_amount   = COALESCE((p_data->>'taxable_amount')::numeric, s.taxable_amount),
+
+    cgst_amount      = COALESCE((p_data->>'cgst_amount')::numeric, s.cgst_amount),
+    sgst_amount      = COALESCE((p_data->>'sgst_amount')::numeric, s.sgst_amount),
+    igst_amount      = COALESCE((p_data->>'igst_amount')::numeric, s.igst_amount),
+
+    tax_amount       = COALESCE((p_data->>'tax_amount')::numeric, s.tax_amount),
+    net_amount       = COALESCE((p_data->>'net_amount')::numeric, s.net_amount),
+
+    paid_amount      = COALESCE((p_data->>'paid_amount')::numeric, s.paid_amount),
+    balance_amount   = COALESCE((p_data->>'balance_amount')::numeric, s.balance_amount),
+
+    remarks          = NULLIF(p_data->>'remarks',''),
+    is_igst          = COALESCE((p_data->>'is_igst')::boolean, s.is_igst)
+  WHERE s.sales_id = p_sales_id;
+
+  /* =========================================================
+     4) Soft-delete OLD items (ACTIVE -> DELETED)
+     ========================================================= */
+  UPDATE pos.sales_invoice_item
+  SET status = 'DELETED'
+  WHERE sales_id = p_sales_id
+    AND status = 'ACTIVE';
+
+  /* =========================================================
+     5) Insert NEW items as ACTIVE
+     ========================================================= */
+  INSERT INTO pos.sales_invoice_item(
+    sales_id, line_no, product_id, quantity, uom, unit_price, mrp,
+    discount_pct, discount_amount, taxable_amount,
+    cgst_amount, sgst_amount, igst_amount,
+    tax_amount, line_total,
+    status
+  )
+  SELECT
+    p_sales_id,
+    (ROW_NUMBER() OVER ())::smallint AS line_no,
+    (it->>'product_id')::char(6),
+    (it->>'quantity')::numeric(12,3),
+    COALESCE(it->>'uom','PCS'),
+    (it->>'unit_price')::numeric(12,2),
+    NULLIF(it->>'mrp','')::numeric(12,2),
+
+    COALESCE((it->>'discount_pct')::numeric(5,2), 0),
+    COALESCE((it->>'discount_amount')::numeric(12,2), 0),
+    COALESCE((it->>'taxable_amount')::numeric(12,2), 0),
+
+    COALESCE((it->>'cgst_amount')::numeric(12,2), 0),
+    COALESCE((it->>'sgst_amount')::numeric(12,2), 0),
+    COALESCE((it->>'igst_amount')::numeric(12,2), 0),
+
+    COALESCE((it->>'tax_amount')::numeric(12,2), 0),
+    COALESCE((it->>'line_total')::numeric(12,2), 0),
+
+    'ACTIVE'::text
+  FROM jsonb_array_elements(v_items) it;
+
+  /* =========================================================
+     6) LEDGER: apply NEW => qty_out
+     ========================================================= */
+  INSERT INTO pos.stock_ledger(
+    company_id, state_id, branch_id, product_id,
+    movement_time, movement_type,
+    qty_in, qty_out,
+    ref_table, ref_id
+  )
+  SELECT
+    v_company_id, v_state_id, v_branch_id,
+    (it->>'product_id')::char(6) AS product_id,
+    now(),
+    'SALE'::text,
+    0::numeric(12,3) AS qty_in,
+    SUM((it->>'quantity')::numeric)::numeric(12,3) AS qty_out,
+    'sales_invoice',
+    p_sales_id
+  FROM jsonb_array_elements(v_items) it
+  GROUP BY (it->>'product_id')::char(6);
+
+  /* =========================================================
+     7) Apply NEW stock: subtract
+     ========================================================= */
+  UPDATE pos.branch_products bp
+  SET on_hand_qty = COALESCE(bp.on_hand_qty, 0) - x.qty
+  FROM (
+    SELECT
+      (it->>'product_id')::char(6) AS product_id,
+      SUM((it->>'quantity')::numeric)::numeric(12,3) AS qty
+    FROM jsonb_array_elements(v_items) it
+    GROUP BY (it->>'product_id')::char(6)
+  ) x
+  WHERE bp.company_id = v_company_id
+    AND bp.state_id   = v_state_id
+    AND bp.branch_id  = v_branch_id
+    AND bp.product_id = x.product_id;
+
+  RETURN 'OK';
+END;
+$$;
+
